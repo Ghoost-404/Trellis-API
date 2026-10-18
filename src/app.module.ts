@@ -208,6 +208,7 @@ import { PauseScope } from "./infrastructure/pause-control/entities/pause-scope.
 import { PauseAuditLog } from "./infrastructure/pause-control/entities/pause-audit-log.entity";
 // Invariant monitor entity
 import { InvariantReportEntity } from "./monitoring/invariant-monitor/entities/invariant-report.entity";
+import { ReleaseModule } from "./common/release/release.module";
 
 @Module({
   imports: [
@@ -400,6 +401,7 @@ import { InvariantReportEntity } from "./monitoring/invariant-monitor/entities/i
     PermissionMatrixModule,
     AbuseDetectionModule,
     AccessibilityModule,
+    ReleaseModule,
   ],
 
   controllers: [AppController, QuotaAdminController],

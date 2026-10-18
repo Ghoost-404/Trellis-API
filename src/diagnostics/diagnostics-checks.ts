@@ -212,6 +212,237 @@ export function checkBootstrapAdmin(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Retry-aware checks (TCP and HTTP with exponential backoff)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface RetryOptions {
+  maxAttempts?: number;
+  backoffMs?: number;
+  timeoutMs?: number;
+  onRetry?: (attempt: number, error?: any) => void;
+}
+
+export async function checkTcpConnectivityWithRetry(
+  label: string,
+  host: string,
+  port: number,
+  probe: (host: string, port: number) => Promise<boolean>,
+  remediation: string,
+  options?: RetryOptions,
+): Promise<DiagnosticCheck & { attempts: number }> {
+  const maxAttempts = options?.maxAttempts ?? 3;
+  const backoffMs = options?.backoffMs ?? 200;
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    const reachable = await probe(host, port);
+    if (reachable) {
+      const detail =
+        attempts === 1
+          ? `Reachable at ${host}:${port}`
+          : `Reachable at ${host}:${port} (succeeded on retry attempt ${attempts})`;
+      return {
+        name: label,
+        status: "pass",
+        detail,
+        attempts,
+      };
+    }
+    if (attempts < maxAttempts) {
+      options?.onRetry?.(attempts);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempts));
+    }
+  }
+
+  return {
+    name: label,
+    status: "fail",
+    detail: `Cannot reach ${host}:${port} after ${attempts} attempts`,
+    remediation,
+    attempts,
+  };
+}
+
+export async function checkHttpEndpointWithRetry(
+  label: string,
+  url: string,
+  probe: (url: string) => Promise<{ ok: boolean; status?: number }>,
+  remediation: string,
+  options?: RetryOptions,
+): Promise<DiagnosticCheck & { attempts: number }> {
+  const maxAttempts = options?.maxAttempts ?? 3;
+  const backoffMs = options?.backoffMs ?? 200;
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    const result = await probe(url);
+    if (result.ok && result.status && result.status < 500) {
+      const detail =
+        attempts === 1
+          ? `${url} responded with HTTP ${result.status}`
+          : `${url} responded with HTTP ${result.status} (succeeded on retry attempt ${attempts})`;
+      return {
+        name: label,
+        status: "pass",
+        detail,
+        attempts,
+      };
+    }
+    if (attempts < maxAttempts) {
+      options?.onRetry?.(attempts);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempts));
+    }
+  }
+
+  return {
+    name: label,
+    status: "warn",
+    detail: `${url} unreachable or returned error after ${attempts} attempts`,
+    remediation,
+    attempts,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Authorization path checks (Database credentials, JWT secret strength, storage permissions)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface DatabaseProbeResult {
+  connected: boolean;
+  authenticated: boolean;
+  errorCategory?: "auth_failed" | "unreachable" | "db_missing" | "none";
+  errorMessage?: string;
+}
+
+export function checkDatabaseAuth(
+  result: DatabaseProbeResult,
+  remediation?: string,
+): DiagnosticCheck {
+  if (result.errorCategory === "auth_failed") {
+    return {
+      name: "db:authentication",
+      status: "fail",
+      detail: "Database authentication failed (invalid username/password)",
+      remediation:
+        remediation ??
+        "Verify username and password in DATABASE_URL. Example: postgresql://user:password@localhost:5432/trellis_dev",
+    };
+  }
+
+  if (result.errorCategory === "db_missing") {
+    return {
+      name: "db:authentication",
+      status: "fail",
+      detail: "Database server connected, but target database does not exist",
+      remediation:
+        remediation ??
+        "Create the target database: createdb -h localhost trellis_dev or via psql: CREATE DATABASE trellis_dev;",
+    };
+  }
+
+  if (result.authenticated && result.connected) {
+    return {
+      name: "db:authentication",
+      status: "pass",
+      detail: "Database credentials and authentication handshake succeeded",
+    };
+  }
+
+  return {
+    name: "db:authentication",
+    status: "fail",
+    detail: `Database connection error: ${result.errorMessage || "unable to connect"}`,
+    remediation:
+      remediation ??
+      "Ensure PostgreSQL is running and DATABASE_URL host and port are correct.",
+  };
+}
+
+const WEAK_SECRETS = [
+  "secret",
+  "changeme",
+  "password",
+  "12345678",
+  "jwtsecret",
+  "development",
+  "supersecret",
+  "trellissecret",
+];
+
+export function checkSecretEntropy(
+  key: string,
+  value: string | undefined,
+  minLength = 32,
+): DiagnosticCheck {
+  if (!value || value.trim() === "") {
+    return {
+      name: `auth:${key}`,
+      status: "fail",
+      detail: `${key} is not set`,
+      remediation: `Generate a strong cryptographic secret with at least ${minLength} characters.`,
+    };
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length < minLength) {
+    return {
+      name: `auth:${key}`,
+      status: "fail",
+      detail: `${key} length (${trimmed.length}) is below recommended ${minLength} characters`,
+      remediation: `Generate a 256-bit secret: node -e "console.log(require('crypto').randomBytes(${minLength}).toString('hex'))"`,
+    };
+  }
+
+  const lower = trimmed.toLowerCase();
+  if (WEAK_SECRETS.some((weak) => lower.includes(weak))) {
+    return {
+      name: `auth:${key}`,
+      status: "warn",
+      detail: `${key} contains predictable dictionary words and is vulnerable to brute-force`,
+      remediation: `Replace with high-entropy cryptographic random bytes: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`,
+    };
+  }
+
+  return {
+    name: `auth:${key}`,
+    status: "pass",
+    detail: `${key} meets cryptographic length and entropy standards`,
+  };
+}
+
+export function checkDirectoryPermissions(
+  label: string,
+  dirPath: string,
+  testWrite: (path: string) => boolean,
+  remediation?: string,
+): DiagnosticCheck {
+  try {
+    const writable = testWrite(dirPath);
+    if (writable) {
+      return {
+        name: label,
+        status: "pass",
+        detail: `Directory ${dirPath} exists with read/write access`,
+      };
+    }
+  } catch (_err) {
+    // handled below
+  }
+
+  return {
+    name: label,
+    status: "fail",
+    detail: `Directory ${dirPath} is not writable or access is denied`,
+    remediation:
+      remediation ??
+      `Ensure process has write permissions to ${dirPath}: chmod -R u+rwX ${dirPath}`,
+  };
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Report aggregation
 // ──────────────────────────────────────────────────────────────────────────────
 

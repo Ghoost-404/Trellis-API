@@ -53,11 +53,17 @@ Non-critical changes require only the subset of **CRITICAL** severity checks.
 - **No Regression** (HIGH): Benchmark tests pass; no O(n²) algorithms; queries indexed
 - **Scaling** (MEDIUM): Known limits documented (max rows, rate limits, job queue behavior)
 
-## Automatable Checks
+## Automatable Checks & Verification Suite
 
-The following checks can be run automatically in CI:
+Trellis API provides an automated verification runner and CLI suite:
 
 ```bash
+# Full automated release readiness invariant verification (migrations, smoke tests, rollback)
+npm run verify:release-readiness
+
+# Automated unit tests for release readiness
+npx jest src/common/release/release-readiness.spec.ts
+
 # Unit test coverage
 npm run test:coverage
 
@@ -66,52 +72,61 @@ npm run test:integration
 
 # Secrets audit
 npm audit
-
-# Performance benchmarks
-npm run bench
 ```
 
-## Manual Checks
+### Automated Verification API
 
-The following checks require human review:
+Maintainers and CI/CD pipelines can trigger automated verification via the REST API:
 
-- Migration reversibility (test locally)
-- Edge case test coverage
-- Locking behavior review
-- Breaking change documentation
-- Rollback procedure validation
+```http
+POST /api/v1/admin/release-checklist/{prNumber}/verify
+Content-Type: application/json
+Authorization: Bearer <ADMIN_JWT>
 
-## Waiving Checks
-
-A check may be waived with **maintainer approval** if:
-
-1. The check is non-critical (MEDIUM or LOW severity)
-2. The reason is documented
-3. An approver explicitly signs off
-
-Waive with:
-```
-PATCH /api/v1/admin/release-checklist/{prNumber}/waive/{checkId}
 {
-  "reason": "This change does not require migrations in this deployment",
-  "approvedBy": "maintainer@example.com"
+  "migrations": [
+    { "filename": "1787313600000-create-module-registry.ts", "content": "..." }
+  ],
+  "smokeProbes": [
+    { "name": "health-check", "endpoint": "/health", "required": true }
+  ],
+  "schemaChanges": [
+    { "table": "users", "column": "avatarUrl", "isNew": true, "isNullable": true, "hasDefault": false }
+  ],
+  "options": {
+    "maxAttempts": 3,
+    "backoffMs": 150
+  }
 }
 ```
 
-## Approval Workflow
+The endpoint runs migration safety parsing, executes smoke probes with retry/backoff, and evaluates rollback backward-compatibility, automatically updating checklist statuses.
 
-1. **Author** submits PR with all changes
-2. **CI** runs automatable checks; results posted to PR
-3. **Maintainer** reviews non-automatable checks
-4. **Maintainer** marks checks as passed or waives with reason
-5. **Maintainer** approves release when all critical checks pass:
-   ```
-   PATCH /api/v1/admin/release-checklist/{prNumber}/approve
-   {
-     "approvedBy": "maintainer@example.com"
-   }
-   ```
-6. **Deployment gate** blocks deployment if checklist is not approved
+## Verification Invariants & Rules
+
+### 1. Migrations
+- **Reversibility**: Every migration must define an operational `down()` method. Migrations with empty down bodies or `throw new Error("irreversible")` fail verification.
+- **Locking Safety**: Rejects `LOCK TABLE` or `ACCESS EXCLUSIVE` in `up()`. These acquire table-level exclusive locks that stall live requests.
+- **Concurrent Indexing**: PostgreSQL `CREATE INDEX` queries must use `CONCURRENTLY` to avoid read/write locks on live tables.
+- **Column Defaults**: New columns added to existing tables must be `NULLABLE` or have a `DEFAULT`. `NOT NULL` without `DEFAULT` breaks concurrent writes from old application versions and prevents zero-downtime rollback.
+
+### 2. Smoke Tests with Automated Retry
+- **Transient Recovery**: Network probes and preflight endpoints are retried up to `maxAttempts` (default 3) with exponential backoff (multiplier 100-200ms) before reporting failure.
+- **Attempt Tracking**: Metrics distinguish immediate successes from retry recoveries (`succeeded on retry attempt N`).
+- **Required vs Optional**: Required probes (database ping, auth challenge, health live) fail the gate if retries exhaust. Optional probes (third-party analytics, external webhook pings) record warnings without blocking release.
+
+### 3. Zero-Downtime Rollback Safety
+- **Backward Compatibility**: In a rolling deployment, version N-1 code runs alongside version N database. Any schema change that breaks version N-1 queries is flagged as a breaking change.
+- **Column Lifecycle**:
+  - *Phase 1*: Add column as nullable or defaulted. Deploy code that writes both versions.
+  - *Phase 2*: Backfill historical rows.
+  - *Phase 3*: Add `NOT NULL` constraints only after 100% population.
+- **Revert Safety**: Down migrations must not drop tables or truncate records without an approved runbook and explicit waiver.
+
+### 4. Authorization & Waiver Audit Trail
+- All checklist mutations require `Role.ADMIN` enforced by `JwtAuthGuard` and `RolesGuard`.
+- Waivers require an approver identity and a detailed justification (minimum 10 characters).
+- Every state transition (`CREATE`, `CHECK_UPDATE`, `WAIVE`, `APPROVE`, `AUTOMATED_VERIFY`) is recorded in an audit log with actor and timestamp.
 
 ## Checklist API
 
